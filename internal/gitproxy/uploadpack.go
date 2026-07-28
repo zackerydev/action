@@ -63,7 +63,28 @@ func (s *Server) handleUploadPack(w http.ResponseWriter, r *http.Request, t targ
 	}
 
 	req := r.Clone(r.Context())
-	req.Body = io.NopCloser(restored)
+	// git sends large upload-pack requests with Transfer-Encoding: chunked, so
+	// ContentLength is -1. net/http/cgi only exports CONTENT_LENGTH when it is
+	// positive, and git-http-backend rejects a POST without it -- the client
+	// sees "RPC failed; HTTP 400" then "expected 'packfile'". Small requests
+	// (the initial fetch) arrive with a length and are unaffected, which is why
+	// only the follow-up promisor fetch for a partial clone failed: it asks for
+	// thousands of blobs at once and is the request git chunks.
+	if req.ContentLength < 0 {
+		full, err := io.ReadAll(restored)
+		if err != nil {
+			s.log.Error("buffer chunked upload-pack body failed", "repo", t.repoKey(), "err", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		req.Body = io.NopCloser(bytes.NewReader(full))
+		req.ContentLength = int64(len(full))
+		req.Header.Set("Content-Length", strconv.Itoa(len(full)))
+		req.Header.Del("Transfer-Encoding")
+		req.TransferEncoding = nil
+	} else {
+		req.Body = io.NopCloser(restored)
+	}
 	s.serveCGI(w, req, t.cgiPath("/git-upload-pack"))
 }
 
